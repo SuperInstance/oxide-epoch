@@ -1,86 +1,71 @@
 # oxide-epoch
 
-GPU infrastructure crate from the SuperInstance ecosystem.
+*Epoch-based memory reclamation for GPU data structures. Ternary epoch states: Active (+1) → Grace (0) → Reclaimable (-1). When the pipeline is asynchronous, you need to know when memory is safe to free.*
 
-## Overview
+## Why This Exists
 
-# oxide-epoch
+Lock-free data structures can't free memory immediately after a logical deletion — other threads (or GPU kernels) might still be reading it. The standard solution is epoch-based reclamation: divide time into epochs, track which epoch each thread is in, and only reclaim memory when no thread holds a reference to it.
 
-Epoch-based memory reclamation for GPU data structures with ternary epoch states.
+On the GPU, this problem is harder. Kernels run asynchronously across hundreds of streaming multiprocessors. There's no garbage collector, no reference counting (without atomic overhead), and no way to interrupt a running kernel. The ternary epoch state machine solves this with three clear phases:
+
+- **Active (+1):** The epoch has live guards. Memory is in use. No reclamation.
+- **Grace Period (0):** No live guards, but too recent for safety. Deferred items wait.
+- **Reclaimable (-1):** Safe to free. All prior epochs are guaranteed idle.
 
 ## Architecture
 
-This crate sits within the **five-layer Oxide Stack**:
-
-| Layer | Crate | Role |
-|-------|-------|------|
-| 1 | open-parallel | Async runtime (tokio fork) |
-| 2 | pincher | "Vector DB as runtime, LLM as compiler" |
-| 3 | flux-core | Bytecode VM + A2A agent protocol |
-| 4 | cuda-oxide | Flux→MIR→Pliron→NVVM→PTX compiler |
-| 5 | cudaclaw | Persistent GPU kernels, warp consensus, SmartCRDT |
-
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
-
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 10 |
-| Lines of Code | 439 |
-| Public API Surface | 18 items |
-| License | Apache-2.0 |
-
-## Installation
-
-```toml
-[dependencies]
-oxide-epoch = "0.1.0"
 ```
+Timeline: ─── Epoch N-1 ─── Epoch N ─── Epoch N+1 ───
+              Reclaimable    Grace         Active
+                  (-1)         (0)          (+1)
+                   ↓
+               free(pending)
+```
+
+### Key Types
+
+- **`Epoch`** — Global epoch counter. Advances when all active guards are from the current epoch.
+- **`Guard`** — RAII guard that pins the current epoch. Created on kernel entry, dropped on exit. While a guard exists, its epoch won't advance past Grace.
+- **`EpochState`** — Active / Grace / Reclaimable. Computed from the global epoch and guard set.
+- **`Bag`** — Queue of deferred reclamation actions. Flush when epoch becomes Reclaimable.
+- **`Collector`** — Manages epochs, guards, and bags. The top-level API.
 
 ## Usage
 
 ```rust
 use oxide_epoch::*;
-// See src/lib.rs tests for complete working examples
+
+let collector = Collector::new();
+
+// Kernel entry — pin epoch
+let guard = collector.enter();
+let epoch_state = collector.state(&guard);
+assert_eq!(epoch_state, EpochState::Active);
+
+// Defer reclamation of old data
+let old_data = vec![1, 2, 3];
+collector.defer(&guard, move || drop(old_data));
+
+// Kernel exit — release guard
+drop(guard);
+
+// After all guards released, advance epoch and reclaim
+collector.try_advance();
+collector.collect(); // Flushes bags from Reclaimable epochs
 ```
 
-### Key Types
+## The Deeper Idea
 
-```
-- pub enum EpochState {
-- pub struct DeferredFree<T> {
-- pub struct EpochGuard {
-    pub fn epoch(&self) -> u64 {
-- pub struct EpochManager {
-    pub fn new() -> Self {
-    pub fn with_grace_lag(grace_lag: u64) -> Self {
-    pub fn current_epoch(&self) -> u64 {
-    pub fn advance(&self) -> u64 {
-    pub fn pin(&self) -> EpochGuard {
-```
+The ternary state machine (Active→Grace→Reclaimable) is the same lifecycle that appears across the SuperInstance ecosystem:
+- `ternary-consensus`: Commit/Pending/Abort
+- `ternary-gc`: Live/Weak/Dead  
+- `agent-phase-change`: Growth/Stasis/Decay
 
-## Design Philosophy
+This isn't coincidence — it's the universal lifecycle of asynchronous resources. The three states capture the essential progression from "in use" through "transitioning" to "done." Binary (in-use/free) can't express the transitional grace period that prevents use-after-free.
 
-This crate uses **ternary algebra** (Z₃) where every value is {-1, 0, +1}:
+## Related Crates
 
-- **+1** → positive signal (healthy, allocated, converged, ready)
-- **0** → neutral (pending, balanced, monitoring, degraded)
-- **-1** → negative signal (failed, free, diverged, overloaded)
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary neural networks at 60% less power
-2. **GPU warp voting** — hardware ballot instructions return ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity (what goes in must come out)
-
-## Testing
-
-```bash
-git clone https://github.com/SuperInstance/oxide-epoch.git
-cd oxide-epoch
-cargo test
-```
-
-## License
-
-Apache-2.0
+- `oxide-chunk` — Memory chunk allocator that uses epoch-based reclamation
+- `oxide-tombstone` — Tombstone deletion (complementary reclamation strategy)
+- `oxide-barrier` — Synchronization barriers that coordinate with epoch advancement
+- `oxide-slotmap` — Slot-based allocation with generation counters (another safe reclamation approach)
