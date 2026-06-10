@@ -1,4 +1,6 @@
 [package]
+description = "oxide-epoch - SuperInstance ecosystem crate"
+repository = "https://github.com/SuperInstance/oxide-epoch"
 name = "oxide-epoch"
 version = "0.1.0"
 edition = "2024"
