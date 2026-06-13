@@ -1,71 +1,104 @@
-# oxide-epoch
+# Oxide Epoch
 
-*Epoch-based memory reclamation for GPU data structures. Ternary epoch states: Active (+1) → Grace (0) → Reclaimable (-1). When the pipeline is asynchronous, you need to know when memory is safe to free.*
+**Oxide Epoch** provides epoch-based memory reclamation (EBR) for GPU data structures with ternary epoch states — `+1` (active), `0` (grace period), `-1` (reclaimable) — enabling lock-free safe deallocation of concurrently accessed data.
 
-## Why This Exists
+## Why It Matters
 
-Lock-free data structures can't free memory immediately after a logical deletion — other threads (or GPU kernels) might still be reading it. The standard solution is epoch-based reclamation: divide time into epochs, track which epoch each thread is in, and only reclaim memory when no thread holds a reference to it.
+Lock-free data structures (concurrent queues, hash maps, skip lists) have a fundamental problem: when thread A removes a node, can it safely free the memory? Thread B might still be reading it. Epoch-based reclamation solves this by tracking which epoch each thread is in. Nodes removed in epoch N can only be freed once all threads have moved past epoch N+1. This is **O(1)** overhead per operation — far cheaper than hazard pointers (**O(k)** per access with k pointers) or reference counting (**O(1)** but with atomic CAS contention).
 
-On the GPU, this problem is harder. Kernels run asynchronously across hundreds of streaming multiprocessors. There's no garbage collector, no reference counting (without atomic overhead), and no way to interrupt a running kernel. The ternary epoch state machine solves this with three clear phases:
+## How It Works
 
-- **Active (+1):** The epoch has live guards. Memory is in use. No reclamation.
-- **Grace Period (0):** No live guards, but too recent for safety. Deferred items wait.
-- **Reclaimable (-1):** Safe to free. All prior epochs are guaranteed idle.
+### Epoch Tracking
 
-## Architecture
+The global epoch counter increments periodically. Each thread pins itself to a snapshot:
 
 ```
-Timeline: ─── Epoch N-1 ─── Epoch N ─── Epoch N+1 ───
-              Reclaimable    Grace         Active
-                  (-1)         (0)          (+1)
-                   ↓
-               free(pending)
+Global: epoch = 5
+
+Thread A: pin() → local_epoch = 5
+Thread B: pin() → local_epoch = 5
+Thread A: unpin() → no longer active
+Thread B: unpin() → no longer active
+
+advance():
+  epoch 4: Active? No. Grace period passed? Yes → Reclaimable (-1)
+  epoch 5: Active? No → Grace Period (0)
+  epoch 6: Active (has live guards) → Active (+1)
 ```
 
-### Key Types
+### Ternary Epoch Classification
 
-- **`Epoch`** — Global epoch counter. Advances when all active guards are from the current epoch.
-- **`Guard`** — RAII guard that pins the current epoch. Created on kernel entry, dropped on exit. While a guard exists, its epoch won't advance past Grace.
-- **`EpochState`** — Active / Grace / Reclaimable. Computed from the global epoch and guard set.
-- **`Bag`** — Queue of deferred reclamation actions. Flush when epoch becomes Reclaimable.
-- **`Collector`** — Manages epochs, guards, and bags. The top-level API.
+For any epoch E relative to current epoch C:
 
-## Usage
+```
+E has live guards            → Active (+1)
+E has no guards, C - E ≤ 1   → Grace Period (0)   [not yet safe]
+E has no guards, C - E > 1   → Reclaimable (-1)   [safe to free]
+```
+
+The grace window of one epoch ensures that any thread that read the epoch value before advancing has had time to finish its critical section.
+
+### Guard Lifecycle
 
 ```rust
-use oxide_epoch::*;
-
-let collector = Collector::new();
-
-// Kernel entry — pin epoch
-let guard = collector.enter();
-let epoch_state = collector.state(&guard);
-assert_eq!(epoch_state, EpochState::Active);
-
-// Defer reclamation of old data
-let old_data = vec![1, 2, 3];
-collector.defer(&guard, move || drop(old_data));
-
-// Kernel exit — release guard
-drop(guard);
-
-// After all guards released, advance epoch and reclaim
-collector.try_advance();
-collector.collect(); // Flushes bags from Reclaimable epochs
+let guard = manager.pin();   // Enter critical section
+// ... access lock-free data structures ...
+drop(guard);                  // Exit critical section
+// Deferred items from our epoch will be reclaimed later
 ```
 
-## The Deeper Idea
+Guard creation: **O(1)** (atomic increment of local epoch counter). Guard destruction: **O(1)**.
 
-The ternary state machine (Active→Grace→Reclaimable) is the same lifecycle that appears across the SuperInstance ecosystem:
-- `ternary-consensus`: Commit/Pending/Abort
-- `ternary-gc`: Live/Weak/Dead  
-- `agent-phase-change`: Growth/Stasis/Decay
+### Deferred Reclamation
 
-This isn't coincidence — it's the universal lifecycle of asynchronous resources. The three states capture the essential progression from "in use" through "transitioning" to "done." Binary (in-use/free) can't express the transitional grace period that prevents use-after-free.
+When a node is removed, it's added to the current epoch's deferred list:
 
-## Related Crates
+```
+manager.defer(node_ptr);  // O(1) — push to Vec
+```
 
-- `oxide-chunk` — Memory chunk allocator that uses epoch-based reclamation
-- `oxide-tombstone` — Tombstone deletion (complementary reclamation strategy)
-- `oxide-barrier` — Synchronization barriers that coordinate with epoch advancement
-- `oxide-slotmap` — Slot-based allocation with generation counters (another safe reclamation approach)
+On `advance_and_reclaim()`:
+1. Increment global epoch: **O(1)** atomic
+2. Scan thread-local epochs: **O(T)** where T = thread count
+3. For each reclaimable epoch, free all deferred items: **O(D)** total deferred items
+
+Total reclaim cost amortized: **O(D/T)** per call.
+
+## Quick Start
+
+```rust
+use oxide_epoch::EpochManager;
+
+let manager = EpochManager::new();
+let guard = manager.pin();
+// ... lock-free operations ...
+drop(guard);
+manager.defer(node_to_free);
+manager.advance_and_reclaim(); // Safely frees deferred items
+```
+
+## API
+
+| Type | Description |
+|------|-------------|
+| `EpochManager` | Global epoch counter with per-thread tracking |
+| `EpochGuard` | RAII guard — active while pinned |
+| `EpochState` | `Active (+1)`, `GracePeriod (0)`, `Reclaimable (-1)` |
+
+Key methods: `pin()`, `defer(ptr)`, `advance_and_reclaim()`, `active_epoch_count()`.
+
+## Architecture Notes
+
+Oxide Epoch provides safe memory reclamation for GPU data structures in the oxide-* stack. In γ + η = C, epoch advancement is γ (growth — making progress on reclamation) while the grace period is η (avoidance — waiting until deallocation is provably safe). Integrates with `oxide-ring` (ring buffer reclamation) and `oxide-tombstone` (lazy deletion garbage collection).
+
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for GPU memory management architecture.
+
+## References
+
+1. Fraser, K. (2004). *Practical Lock-Freedom*. PhD Thesis, University of Cambridge. (On epoch-based reclamation)
+2. Hart, D. E. et al. (2007). "Performance of memory reclamation for lockless synchronization." *Journal of Parallel and Distributed Computing*, 67(12), 1270–1285.
+3. Lea, D. (2013). "Reclamation for lock-free data structures." *java.util.concurrent documentation*.
+
+## License
+
+MIT
